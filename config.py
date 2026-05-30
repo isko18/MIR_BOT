@@ -40,9 +40,12 @@ class Settings:
     welcome_brand: str
     support_bot_username: str | None
     public_chat_username: str | None
+    required_channel_username: str | None
+    required_channel_id: str | None
     welcome_deposit_pct: str
     welcome_withdraw_pct: str
     welcome_security_line: str
+    brand_logo_path: Path | None
     brand_logo_url: str | None
     # Масштаб: Redis для FSM (несколько процессов / переживает рестарт). Пусто — MemoryStorage.
     redis_url: str | None
@@ -65,6 +68,17 @@ def _parse_admin_ids(raw: str) -> frozenset[int]:
     return frozenset(ids)
 
 
+def _resolve_brand_logo_path() -> Path | None:
+    raw = os.getenv("BRAND_LOGO_PATH", "").strip()
+    if raw:
+        path = Path(raw)
+        if not path.is_absolute():
+            path = _ROOT / path
+        return path if path.is_file() else None
+    default = _ROOT / "лого.png"
+    return default if default.is_file() else None
+
+
 def load_settings() -> Settings:
     user = os.getenv("USER_BOT_TOKEN", "").strip()
     admin = os.getenv("ADMIN_BOT_TOKEN", "").strip()
@@ -81,18 +95,26 @@ def load_settings() -> Settings:
     brand = os.getenv("WELCOME_BRAND", "LUX ON!").strip() or "LUX ON!"
     support_bot = os.getenv("SUPPORT_BOT_USERNAME", "").strip() or None
     pub_chat = os.getenv("PUBLIC_CHAT_USERNAME", "").strip() or None
+    channel_raw = os.getenv("REQUIRED_CHANNEL_USERNAME", "MIRKG_NEWS").strip()
+    required_channel = channel_raw.lstrip("@") if channel_raw else None
+    required_channel_id = os.getenv("REQUIRED_CHANNEL_ID", "").strip() or None
     dep_pct = _format_welcome_pct(os.getenv("WELCOME_DEPOSIT_PCT"))
     wdr_pct = _format_welcome_pct(os.getenv("WELCOME_WITHDRAW_PCT"))
     security = os.getenv("WELCOME_SECURITY_LINE", "").strip() or (
         "🔒 Финансовый контроль обеспечен личным отделом безопасности"
     )
 
-    # Картинка-«иконка» в приветствии; пустая строка в .env отключает
+    # Локальный файл лого в приветствии (по умолчанию «лого.png» в корне проекта)
+    brand_logo_path = _resolve_brand_logo_path()
+
+    # Запасной URL, если локального файла нет; пустая строка в .env отключает
     _logo_raw = os.environ.get("BRAND_LOGO_URL")
     if _logo_raw is not None:
         brand_logo = _logo_raw.strip() or None
-    else:
+    elif brand_logo_path is None:
         brand_logo = "https://magicclick.partners/assets/images/1680278989.jpg"
+    else:
+        brand_logo = None
 
     redis_url = os.getenv("REDIS_URL", "").strip() or None
     fsm_ttl_raw = os.getenv("FSM_REDIS_TTL_SEC", "").strip()
@@ -109,9 +131,12 @@ def load_settings() -> Settings:
         welcome_brand=brand,
         support_bot_username=support_bot,
         public_chat_username=pub_chat,
+        required_channel_username=required_channel,
+        required_channel_id=required_channel_id,
         welcome_deposit_pct=dep_pct,
         welcome_withdraw_pct=wdr_pct,
         welcome_security_line=security,
+        brand_logo_path=brand_logo_path,
         brand_logo_url=brand_logo,
         redis_url=redis_url,
         fsm_redis_ttl_sec=fsm_redis_ttl_sec,

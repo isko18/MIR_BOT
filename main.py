@@ -8,17 +8,20 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from admin_bot.handlers import router as admin_router
+from bot_commands import setup_bot_commands
 from config import settings
 from database import close_db, init_db
 from logo_fetch import close_http
 from user_bot.flood_middleware import MessageFloodMiddleware
+from user_bot.subscription_middleware import SubscriptionMiddleware
+from user_bot.subscription import init_subscription_channel
 from user_bot.handlers import router as user_router
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# Только нужные типы апдейтов — меньше трафика и CPU при 10k+ пользователей.
-_POLL_UPDATES = ["message", "callback_query", "my_chat_member"]
+# chat_member — авто-подтверждение при подписке на канал
+_POLL_UPDATES = ["message", "callback_query", "my_chat_member", "chat_member"]
 
 
 def _build_fsm_storage():
@@ -68,10 +71,14 @@ async def run() -> None:
     user_bot = Bot(settings.user_bot_token, session=user_session)
     admin_bot = Bot(settings.admin_bot_token, session=admin_session)
 
+    await init_subscription_channel(user_bot)
+    await setup_bot_commands(user_bot, admin_bot)
+
     user_dp = Dispatcher(storage=storage)
     admin_dp = Dispatcher(storage=storage)
 
     user_dp.message.middleware(MessageFloodMiddleware())
+    user_dp.message.middleware(SubscriptionMiddleware())
 
     user_dp.workflow_data["admin_bot"] = admin_bot
     admin_dp.workflow_data["user_bot"] = user_bot

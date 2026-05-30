@@ -93,3 +93,19 @@ def guess_logo_filename(url: str) -> str:
     if u.endswith(".webp"):
         return "logo.webp"
     return "logo.jpg"
+
+
+async def get_welcome_logo_bytes() -> tuple[bytes | None, str]:
+    """Лого при /start: сначала локальный файл, затем URL из настроек."""
+    from config import settings
+
+    path = settings.brand_logo_path
+    if path is not None and path.is_file():
+        return path.read_bytes(), path.name
+
+    url = settings.brand_logo_url
+    if url:
+        data = await fetch_image_bytes(url)
+        if data:
+            return data, guess_logo_filename(url)
+    return None, "logo.png"

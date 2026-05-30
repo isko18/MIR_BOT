@@ -185,3 +185,65 @@ async def user_history(user_id: int, limit: int = 20) -> list[dict]:
         )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+
+async def admin_deposits_list(
+    status: str | None = None,
+    limit: int = 10,
+    offset: int = 0,
+) -> list[dict]:
+    conn = await _ensure_conn()
+    async with _db_lock:
+        if status:
+            cur = await conn.execute(
+                """
+                SELECT d.*, u.username, u.first_name
+                FROM deposits d
+                LEFT JOIN users u ON u.user_id = d.user_id
+                WHERE d.status = ?
+                ORDER BY d.id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (status, limit, offset),
+            )
+        else:
+            cur = await conn.execute(
+                """
+                SELECT d.*, u.username, u.first_name
+                FROM deposits d
+                LEFT JOIN users u ON u.user_id = d.user_id
+                ORDER BY d.id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def admin_deposits_count(status: str | None = None) -> int:
+    conn = await _ensure_conn()
+    async with _db_lock:
+        if status:
+            cur = await conn.execute(
+                "SELECT COUNT(*) FROM deposits WHERE status = ?",
+                (status,),
+            )
+        else:
+            cur = await conn.execute("SELECT COUNT(*) FROM deposits")
+        row = await cur.fetchone()
+        return int(row[0])
+
+
+async def admin_deposits_stats() -> dict[str, dict]:
+    conn = await _ensure_conn()
+    async with _db_lock:
+        cur = await conn.execute(
+            """
+            SELECT status, COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total
+            FROM deposits
+            GROUP BY status
+            """
+        )
+        rows = await cur.fetchall()
+        return {r["status"]: {"count": int(r["cnt"]), "total": float(r["total"])} for r in rows}

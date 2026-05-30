@@ -7,10 +7,10 @@ import re
 from html import escape
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.filters import ChatMemberUpdatedFilter, Command, CommandStart, JOIN_TRANSITION, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import BufferedInputFile, CallbackQuery, ChatMemberUpdated, KeyboardButton, Message, ReplyKeyboardMarkup
 
 from bookmakers import bookmaker_display
 from config import settings
@@ -26,8 +26,18 @@ from .receipt_timer import (
     cancel_receipt_deadline,
     schedule_receipt_deadline,
 )
-from logo_fetch import fetch_image_bytes, get_bookmaker_logo_bytes, guess_logo_filename
+from logo_fetch import fetch_image_bytes, get_bookmaker_logo_bytes, get_welcome_logo_bytes, guess_logo_filename
 from texts import INSTRUCTION, WITHDRAW, support_text, welcome_banner
+from user_bot.subscription import (
+    BTN_CHECK_SUBSCRIPTION,
+    is_required_channel,
+    is_subscription_exempt,
+    send_subscription_prompt,
+    subscription_check_error,
+    subscription_check_ready,
+    subscription_inline_kb,
+    verify_user_subscribed,
+)
 
 router = Router(name="user")
 log = logging.getLogger(__name__)
@@ -258,20 +268,128 @@ async def answer_caption_with_bookmaker_logo(
     await message.answer(caption, reply_markup=reply_markup)
 
 
-async def send_home_with_logo(message: Message, first_name: str | None) -> None:
+async def send_home_to_user(bot: Bot, user_id: int, first_name: str | None) -> None:
     text = welcome_banner(first_name)
     kb = main_menu_kb()
-    url = settings.brand_logo_url
-    if url:
-        data = await fetch_image_bytes(url)
-        if data:
-            await message.answer_photo(
-                photo=BufferedInputFile(data, filename=guess_logo_filename(url)),
-                caption=text,
-                reply_markup=kb,
-            )
-            return
-    await message.answer(text, reply_markup=kb)
+    data, fname = await get_welcome_logo_bytes()
+    if data:
+        await bot.send_photo(
+            chat_id=user_id,
+            photo=BufferedInputFile(data, filename=fname),
+            caption=text,
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        return
+    await bot.send_message(chat_id=user_id, text=text, parse_mode="HTML", reply_markup=kb)
+
+
+async def send_home_with_logo(message: Message, first_name: str | None) -> None:
+    await send_home_to_user(message.bot, message.from_user.id, first_name)
+
+
+async def _clear_user_flow(state: FSMContext, user_id: int) -> None:
+    cancel_receipt_deadline(user_id)
+    cancel_payment_countdown(user_id)
+    await state.clear()
+
+
+async def _subscription_fail_message(message: Message, config_error: str | None) -> None:
+    ch = (settings.required_channel_username or "MIRKG_NEWS").lstrip("@")
+    hint = ""
+    if config_error and "member list is inaccessible" in config_error.lower():
+        hint = (
+            "\n\nПричина: бот не может видеть участников канала.\n"
+            "Добавьте пользовательский бот в @"
+            f"{ch} как <b>администратора</b> (достаточно права «добавление участников»)."
+        )
+    await message.answer(
+        "⚠️ Не удалось проверить подписку автоматически."
+        f"{hint}\n\n"
+        "После настройки перезапустите бота.",
+        parse_mode="HTML",
+        reply_markup=subscription_inline_kb(ch),
+    )
+
+
+async def _enter_home_if_subscribed(message: Message, state: FSMContext) -> bool:
+    if is_subscription_exempt(message.from_user.id):
+        await _clear_user_flow(state, message.from_user.id)
+        await send_home_with_logo(message, message.from_user.first_name)
+        return True
+
+    channel = settings.required_channel_username
+    if not channel:
+        await _clear_user_flow(state, message.from_user.id)
+        await send_home_with_logo(message, message.from_user.first_name)
+        return True
+
+    if not subscription_check_ready():
+        await send_subscription_prompt(message, channel)
+        await _subscription_fail_message(message, subscription_check_error())
+        return False
+
+    subscribed, config_error = await verify_user_subscribed(
+        message.bot,
+        message.from_user.id,
+        retries=4,
+        delay_sec=1.0,
+    )
+    if subscribed:
+        await _clear_user_flow(state, message.from_user.id)
+        await send_home_with_logo(message, message.from_user.first_name)
+        return True
+
+    await send_subscription_prompt(message, channel)
+    if config_error:
+        await _subscription_fail_message(message, config_error)
+    return False
+
+
+async def _handle_subscription_check(
+    message: Message,
+    user_id: int,
+    first_name: str | None,
+    state: FSMContext,
+    *,
+    from_callback: bool = False,
+) -> None:
+    channel = settings.required_channel_username
+    if not channel:
+        await _clear_user_flow(state, user_id)
+        await send_home_to_user(message.bot, user_id, first_name)
+        return
+
+    if not subscription_check_ready():
+        await _subscription_fail_message(message, subscription_check_error())
+        return
+
+    subscribed, config_error = await verify_user_subscribed(
+        message.bot,
+        user_id,
+        retries=4,
+        delay_sec=1.0,
+    )
+    if subscribed:
+        await _clear_user_flow(state, user_id)
+        await send_home_to_user(message.bot, user_id, first_name)
+        return
+
+    if config_error:
+        await _subscription_fail_message(message, config_error)
+        return
+
+    ch = channel.lstrip("@")
+    text = (
+        "❌ Подписка пока не видна.\n\n"
+        f"1. Подпишитесь на @{ch}\n"
+        "2. Вернитесь в бот — проверка произойдёт автоматически\n\n"
+        "Если только что подписались, подождите пару секунд и нажмите /start."
+    )
+    if from_callback:
+        await message.answer(text, reply_markup=subscription_inline_kb(ch))
+    else:
+        await message.answer(text, reply_markup=subscription_inline_kb(ch))
 
 
 @router.message(StateFilter(*DEPOSIT_STATES), CommandStart())
@@ -299,15 +417,64 @@ async def deposit_block_parallel(message: Message, state: FSMContext) -> None:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
-    cancel_receipt_deadline(message.from_user.id)
-    cancel_payment_countdown(message.from_user.id)
-    await state.clear()
     await upsert_user(
         message.from_user.id,
         message.from_user.username,
         message.from_user.first_name,
     )
-    await send_home_with_logo(message, message.from_user.first_name)
+    await _enter_home_if_subscribed(message, state)
+
+
+@router.message(F.text == BTN_CHECK_SUBSCRIPTION)
+async def check_subscription_message(message: Message, state: FSMContext) -> None:
+    await _handle_subscription_check(
+        message,
+        message.from_user.id,
+        message.from_user.first_name,
+        state,
+    )
+
+
+@router.callback_query(F.data == "sub_check")
+async def check_subscription_callback(query: CallbackQuery, state: FSMContext) -> None:
+    if not query.from_user or not query.message:
+        await query.answer()
+        return
+    await query.answer("Проверяем подписку…")
+    await _handle_subscription_check(
+        query.message,
+        query.from_user.id,
+        query.from_user.first_name,
+        state,
+        from_callback=True,
+    )
+
+
+@router.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
+async def on_channel_subscribe(event: ChatMemberUpdated, bot: Bot) -> None:
+    if not is_required_channel(event.chat.id, event.chat.username):
+        return
+    user = event.from_user
+    if not user:
+        return
+
+    await upsert_user(user.id, user.username, user.first_name)
+    subscribed, config_error = await verify_user_subscribed(bot, user.id, retries=3, delay_sec=0.5)
+    if not subscribed:
+        if config_error:
+            log.warning("Auto subscribe notify skipped for %s: %s", user.id, config_error)
+        return
+
+    cancel_receipt_deadline(user.id)
+    cancel_payment_countdown(user.id)
+    try:
+        await bot.send_message(
+            user.id,
+            "✅ Подписка подтверждена! Добро пожаловать.",
+        )
+        await send_home_to_user(bot, user.id, user.first_name)
+    except Exception as exc:
+        log.warning("Could not notify user %s after channel join: %s", user.id, exc)
 
 
 @router.message(Command("menu"))
