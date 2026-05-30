@@ -1,0 +1,25 @@
+services:
+  bot:
+    build:
+      context: ..
+      dockerfile: devops/Dockerfile
+    container_name: telegram-bot
+    restart: unless-stopped
+    env_file: ../.env
+    volumes:
+      - ../data:/app/data
+      - ../photo:/app/photo
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+
+  redis:
+    image: redis:7-alpine
+    container_name: bot-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:

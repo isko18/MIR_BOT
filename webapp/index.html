@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover"
+    />
+    <title>Выберите счет</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  </head>
+  <body>
+    <div class="app" id="app">
+      <header class="header">
+        <h1 class="title">Выберите счет</h1>
+      </header>
+
+      <main class="main">
+        <div class="grid" id="account-grid" aria-label="Список счетов"></div>
+      </main>
+
+      <footer class="footer">
+        <button type="button" class="btn btn-cancel" id="btn-cancel">
+          Отменить заявку
+        </button>
+      </footer>
+    </div>
+
+    <script src="script.js" defer></script>
+  </body>
+</html>

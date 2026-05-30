@@ -1,0 +1,20 @@
+[Unit]
+Description=Telegram User & Admin Bot
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot
+Group=bot
+WorkingDirectory=/home/kurut
+EnvironmentFile=/home/kurut/.env
+ExecStart=/home/kurut/.venv/bin/python -u /home/kurut/main.py
+Restart=always
+RestartSec=10
+
+# Ограничения
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+# Запуск без Redis (FSM в памяти). Для малой нагрузки.
+services:
+  bot:
+    build:
+      context: ..
+      dockerfile: devops/Dockerfile
+    container_name: telegram-bot
+    restart: unless-stopped
+    env_file: ../.env
+    volumes:
+      - ../data:/app/data
+      - ../photo:/app/photo
+    # REDIS_URL не задан — используется MemoryStorage
