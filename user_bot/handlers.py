@@ -15,7 +15,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery, ChatMemberUpdated, K
 from bookmakers import bookmaker_display
 from config import settings
 from database import attach_receipt, create_deposit, upsert_user, user_history
-from qr_util import make_qr_png_bytes
+from qr_util import get_payment_qr_bytes
 from .payment_countdown import (
     cancel_payment_countdown,
     format_qr_payment_caption,
@@ -567,7 +567,7 @@ async def deposit_amount(
     await state.update_data(deposit_id=deposit_id, amount=amount)
     await state.set_state(DepositFSM.receipt)
 
-    png = make_qr_png_bytes(settings.payment_qr_payload)
+    png, png_name = get_payment_qr_bytes()
     cap_details = (
         "💰 Пополнение счета\n\n"
         f"Счёт: {bookmaker_display(title)}\n"
@@ -583,7 +583,7 @@ async def deposit_amount(
             caption=cap_details,
         )
     qr_msg = await message.answer_photo(
-        photo=BufferedInputFile(png, filename="payment.png"),
+        photo=BufferedInputFile(png, filename=png_name),
         caption=qr_caption,
         reply_markup=deposit_step_kb(),
     )

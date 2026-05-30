@@ -36,6 +36,7 @@ class Settings:
     admin_bot_token: str
     admin_ids: frozenset[int]
     payment_qr_payload: str
+    payment_qr_path: Path | None
     support_username: str | None
     welcome_brand: str
     support_bot_username: str | None
@@ -79,6 +80,17 @@ def _resolve_brand_logo_path() -> Path | None:
     return default if default.is_file() else None
 
 
+def _resolve_payment_qr_path() -> Path | None:
+    raw = os.getenv("PAYMENT_QR_IMAGE", "").strip()
+    if raw:
+        path = Path(raw)
+        if not path.is_absolute():
+            path = _ROOT / path
+        return path if path.is_file() else None
+    default = _ROOT / "Илиязбек Г. Ш..png"
+    return default if default.is_file() else None
+
+
 def load_settings() -> Settings:
     user = os.getenv("USER_BOT_TOKEN", "").strip()
     admin = os.getenv("ADMIN_BOT_TOKEN", "").strip()
@@ -104,6 +116,9 @@ def load_settings() -> Settings:
         "🔒 Финансовый контроль обеспечен личным отделом безопасности"
     )
 
+    # Локальный QR для оплаты (по умолчанию «Илиязбек Г. Ш..png» в корне проекта)
+    payment_qr_path = _resolve_payment_qr_path()
+
     # Локальный файл лого в приветствии (по умолчанию «лого.png» в корне проекта)
     brand_logo_path = _resolve_brand_logo_path()
 
@@ -127,6 +142,7 @@ def load_settings() -> Settings:
         admin_bot_token=admin,
         admin_ids=_parse_admin_ids(admins_raw),
         payment_qr_payload=payload,
+        payment_qr_path=payment_qr_path,
         support_username=support,
         welcome_brand=brand,
         support_bot_username=support_bot,
