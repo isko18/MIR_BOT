@@ -7,6 +7,7 @@ from aiogram.types import Message, TelegramObject
 
 from config import settings
 from user_bot.subscription import (
+    is_subscribed_cached,
     is_subscription_exempt,
     send_subscription_prompt,
     subscription_check_ready,
@@ -32,7 +33,7 @@ class SubscriptionMiddleware(BaseMiddleware):
         if not user:
             return await handler(event, data)
 
-        if is_subscription_exempt(user.id):
+        if is_subscription_exempt(user.id) or is_subscribed_cached(user.id):
             return await handler(event, data)
 
         text = (event.text or "").strip()
@@ -40,12 +41,9 @@ class SubscriptionMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         bot: Bot = data["bot"]
-        subscribed, _err = await verify_user_subscribed(
-            bot,
-            user.id,
-            retries=2,
-            delay_sec=0.8,
-        )
+        # Один запрос без повторов: это горячий путь на каждое сообщение, а повторы
+        # с задержкой нужны только сразу после подписки — там свои retries.
+        subscribed, _err = await verify_user_subscribed(bot, user.id, retries=1)
         if subscribed:
             return await handler(event, data)
 

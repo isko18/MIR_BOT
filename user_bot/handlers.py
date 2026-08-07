@@ -1,20 +1,45 @@
 from __future__ import annotations
 
-import asyncio
 import io
 import logging
 import re
 from html import escape
 
+from decimal import Decimal
+
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import ChatMemberUpdatedFilter, Command, CommandStart, JOIN_TRANSITION, StateFilter
+from aiogram.filters import (
+    JOIN_TRANSITION,
+    LEAVE_TRANSITION,
+    ChatMemberUpdatedFilter,
+    Command,
+    CommandStart,
+    StateFilter,
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, CallbackQuery, ChatMemberUpdated, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    ChatMemberUpdated,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 
 from bookmakers import bookmaker_display
 from config import settings
-from database import attach_receipt, create_deposit, upsert_user, user_history
+from database import (
+    add_admin_message,
+    attach_receipt,
+    create_deposit,
+    upsert_user,
+    user_confirmed_count,
+    user_history,
+)
+from money import AmountError, format_amount, format_kgs, parse_amount
 from qr_util import get_payment_qr_bytes
 from .payment_countdown import (
     cancel_payment_countdown,
@@ -26,10 +51,11 @@ from .receipt_timer import (
     cancel_receipt_deadline,
     schedule_receipt_deadline,
 )
-from logo_fetch import fetch_image_bytes, get_bookmaker_logo_bytes, get_welcome_logo_bytes, guess_logo_filename
+from logo_fetch import get_bookmaker_logo_bytes, get_welcome_logo_bytes
 from texts import INSTRUCTION, WITHDRAW, support_text, welcome_banner
 from user_bot.subscription import (
     BTN_CHECK_SUBSCRIPTION,
+    drop_subscription_cache,
     is_required_channel,
     is_subscription_exempt,
     send_subscription_prompt,
@@ -41,6 +67,11 @@ from user_bot.subscription import (
 
 router = Router(name="user")
 log = logging.getLogger(__name__)
+
+_MIN_AMOUNT = Decimal(str(settings.min_amount_kgs))
+_MAX_AMOUNT = Decimal(str(settings.max_amount_kgs))
+
+HISTORY_LIMIT = 20
 
 # Тексты кнопок — только эти константы (букмекеры без эмодзи: в кнопку картинку Telegram не вставить)
 BTN_DEPOSIT = "💳 Пополнить"
@@ -60,9 +91,11 @@ BTN_TO_MENU = "🏠 В меню"
 
 BOOKMAKER_BY_BUTTON = {
     BTN_BM_1XBET: "1XBET",
-    BTN_BM_1WIN: "1WIN",
     BTN_BM_MELBET: "MELBET",
-    BTN_BM_MOSTBET: "MOSTBET",
+    # 1Win и Mostbet временно отключены — чтобы вернуть, раскомментируйте здесь
+    # и в bookmaker_kb() ниже.
+    # BTN_BM_1WIN: "1WIN",
+    # BTN_BM_MOSTBET: "MOSTBET",
 }
 
 CANCEL_LABELS = frozenset({BTN_CANCEL, BTN_TO_MENU})
@@ -105,8 +138,8 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
 def bookmaker_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=BTN_BM_1XBET), KeyboardButton(text=BTN_BM_1WIN)],
-            [KeyboardButton(text=BTN_BM_MELBET), KeyboardButton(text=BTN_BM_MOSTBET)],
+            [KeyboardButton(text=BTN_BM_1XBET), KeyboardButton(text=BTN_BM_MELBET)],
+            # [KeyboardButton(text=BTN_BM_1WIN), KeyboardButton(text=BTN_BM_MOSTBET)],
             [KeyboardButton(text=BTN_CANCEL), KeyboardButton(text=BTN_TO_MENU)],
         ],
         resize_keyboard=True,
@@ -120,11 +153,6 @@ def deposit_step_kb() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         input_field_placeholder="Ввод или «Отмена»…",
     )
-
-
-def _format_amount_kgs(amount: float) -> str:
-    s = f"{amount:,.0f}"
-    return s.replace(",", " ")
 
 
 def _history_html(
@@ -147,7 +175,7 @@ def _history_html(
     out = head
     for r in rows:
         bm = escape(bookmaker_display(r["bookmaker"]))
-        amt = _format_amount_kgs(float(r["amount"]))
+        amt = format_amount(r["amount"])
         acc = escape(str(r["account_id"]))
         when = escape(str(r["confirmed_at"] or r["created_at"]))
         rid = int(r["id"])
@@ -160,18 +188,22 @@ def _history_html(
     if out[-1] == "":
         out.pop()
     out.append("")
-    if total_all is not None:
-        if is_last_chunk:
-            out.append(f"<i>Всего подтверждённых: {total_all}</i>")
-        else:
-            out.append("<i>⏬ Продолжение ниже…</i>")
+    if not is_last_chunk:
+        out.append("<i>⏬ Продолжение ниже…</i>")
+    elif total_all is not None:
+        out.append(f"<i>Всего подтверждённых: {total_all}</i>")
     else:
         out.append(f"<i>В списке: {len(rows)}</i>")
     return "\n".join(out)
 
 
-def _history_html_chunks(all_rows: list[dict]) -> list[str]:
-    """Дробит список на части ≤ ~3900 символов (лимит Telegram ~4096)."""
+def _history_html_chunks(all_rows: list[dict], grand_total: int) -> list[str]:
+    """Дробит список на части ≤ ~3900 символов (лимит Telegram ~4096).
+
+    grand_total — сколько подтверждённых заявок у пользователя всего; в списке
+    показываются только последние HISTORY_LIMIT, и раньше подпись выдавала их
+    число за «всего».
+    """
     if not all_rows:
         return []
     max_len = 3900
@@ -189,7 +221,7 @@ def _history_html_chunks(all_rows: list[dict]) -> list[str]:
                 part,
                 continuation=bool(chunks),
                 is_last_chunk=is_last,
-                total_all=total,
+                total_all=grand_total,
             )
             if len(text) <= max_len:
                 best_end = mid
@@ -203,7 +235,7 @@ def _history_html_chunks(all_rows: list[dict]) -> list[str]:
                     part,
                     continuation=bool(chunks),
                     is_last_chunk=start + 1 >= total,
-                    total_all=total,
+                    total_all=grand_total,
                 )
             )
             start += 1
@@ -214,7 +246,7 @@ def _history_html_chunks(all_rows: list[dict]) -> list[str]:
                     part,
                     continuation=bool(chunks),
                     is_last_chunk=best_end == total - 1,
-                    total_all=total,
+                    total_all=grand_total,
                 )
             )
             start = best_end + 1
@@ -295,7 +327,7 @@ async def _clear_user_flow(state: FSMContext, user_id: int) -> None:
 
 
 async def _subscription_fail_message(message: Message, config_error: str | None) -> None:
-    ch = (settings.required_channel_username or "MIRKG_NEWS").lstrip("@")
+    ch = (settings.required_channel_username or "the100som").lstrip("@")
     hint = ""
     if config_error and "member list is inaccessible" in config_error.lower():
         hint = (
@@ -402,11 +434,16 @@ async def cmd_menu_blocked(message: Message, state: FSMContext) -> None:
     await deposit_reply_blocked(message, state)
 
 
+@router.message(StateFilter(*DEPOSIT_STATES), Command("cancel"))
 @router.message(StateFilter(*DEPOSIT_STATES), F.text.in_(CANCEL_LABELS))
 async def deposit_cancel(message: Message, state: FSMContext) -> None:
-    cancel_receipt_deadline(message.from_user.id)
-    cancel_payment_countdown(message.from_user.id)
-    await state.clear()
+    await _clear_user_flow(state, message.from_user.id)
+    await send_home_with_logo(message, message.from_user.first_name)
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    await _clear_user_flow(state, message.from_user.id)
     await send_home_with_logo(message, message.from_user.first_name)
 
 
@@ -427,6 +464,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 @router.message(F.text == BTN_CHECK_SUBSCRIPTION)
 async def check_subscription_message(message: Message, state: FSMContext) -> None:
+    drop_subscription_cache(message.from_user.id)
     await _handle_subscription_check(
         message,
         message.from_user.id,
@@ -441,6 +479,8 @@ async def check_subscription_callback(query: CallbackQuery, state: FSMContext) -
         await query.answer()
         return
     await query.answer("Проверяем подписку…")
+    # Пользователь только что подписался — кэш заведомо устарел.
+    drop_subscription_cache(query.from_user.id)
     await _handle_subscription_check(
         query.message,
         query.from_user.id,
@@ -459,7 +499,9 @@ async def on_channel_subscribe(event: ChatMemberUpdated, bot: Bot) -> None:
         return
 
     await upsert_user(user.id, user.username, user.first_name)
-    subscribed, config_error = await verify_user_subscribed(bot, user.id, retries=3, delay_sec=0.5)
+    subscribed, config_error = await verify_user_subscribed(
+        bot, user.id, retries=3, delay_sec=0.5, use_cache=False
+    )
     if not subscribed:
         if config_error:
             log.warning("Auto subscribe notify skipped for %s: %s", user.id, config_error)
@@ -477,11 +519,18 @@ async def on_channel_subscribe(event: ChatMemberUpdated, bot: Bot) -> None:
         log.warning("Could not notify user %s after channel join: %s", user.id, exc)
 
 
+@router.chat_member(ChatMemberUpdatedFilter(LEAVE_TRANSITION))
+async def on_channel_unsubscribe(event: ChatMemberUpdated) -> None:
+    """Отписался — сразу снимаем доступ, не дожидаясь истечения TTL кэша."""
+    if not is_required_channel(event.chat.id, event.chat.username):
+        return
+    if event.from_user:
+        drop_subscription_cache(event.from_user.id)
+
+
 @router.message(Command("menu"))
 async def cmd_menu(message: Message, state: FSMContext) -> None:
-    cancel_receipt_deadline(message.from_user.id)
-    cancel_payment_countdown(message.from_user.id)
-    await state.clear()
+    await _clear_user_flow(state, message.from_user.id)
     await send_home_with_logo(message, message.from_user.first_name)
 
 
@@ -528,8 +577,8 @@ async def deposit_account_id(message: Message, state: FSMContext) -> None:
     await state.set_state(DepositFSM.amount)
     await message.answer(
         "💰 Пополнение счета\n\n"
-        f"Минимум: {settings.min_amount_kgs:.0f} KGS\n"
-        f"Максимум: {settings.max_amount_kgs:,.0f} KGS\n\n"
+        f"Минимум: {format_kgs(_MIN_AMOUNT)}\n"
+        f"Максимум: {format_kgs(_MAX_AMOUNT)}\n\n"
         "Введите сумму пополнения:",
         reply_markup=deposit_step_kb(),
     )
@@ -542,22 +591,35 @@ async def deposit_amount(
     dispatcher: Dispatcher,
     bot: Bot,
 ) -> None:
-    raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
     try:
-        amount = float(raw)
-    except ValueError:
-        await message.answer("Введите число — сумму в KGS.")
-        return
-    if amount < settings.min_amount_kgs or amount > settings.max_amount_kgs:
+        amount_dec = parse_amount(message.text or "")
+    except AmountError:
         await message.answer(
-            f"Сумма должна быть от {settings.min_amount_kgs:.0f} до {settings.max_amount_kgs:,.0f} KGS."
+            "Введите сумму числом, например: 500 или 1500.50",
+            reply_markup=deposit_step_kb(),
+        )
+        return
+    if amount_dec < _MIN_AMOUNT or amount_dec > _MAX_AMOUNT:
+        await message.answer(
+            f"Сумма должна быть от {format_amount(_MIN_AMOUNT)} "
+            f"до {format_amount(_MAX_AMOUNT)} KGS.",
+            reply_markup=deposit_step_kb(),
         )
         return
 
     data = await state.get_data()
-    title = data["bookmaker_title"]
-    account_id = data["account_id"]
+    title = data.get("bookmaker_title")
+    account_id = data.get("account_id")
+    if not title or not account_id:
+        # FSM переживает рестарт (Redis), а данные шага могли не сохраниться.
+        await state.clear()
+        await message.answer(
+            f"Сессия сброшена. Начните пополнение снова: {BTN_DEPOSIT}",
+            reply_markup=main_menu_kb(),
+        )
+        return
 
+    amount = float(amount_dec)
     deposit_id = await create_deposit(
         user_id=message.from_user.id,
         bookmaker=title,
@@ -567,12 +629,12 @@ async def deposit_amount(
     await state.update_data(deposit_id=deposit_id, amount=amount)
     await state.set_state(DepositFSM.receipt)
 
-    png, png_name = get_payment_qr_bytes()
+    png, png_name = await get_payment_qr_bytes()
     cap_details = (
         "💰 Пополнение счета\n\n"
         f"Счёт: {bookmaker_display(title)}\n"
         f"ID: {account_id}\n"
-        f"Сумма: {amount:,.0f} KGS"
+        f"Сумма: {format_kgs(amount)}"
     )
     qr_caption = format_qr_payment_caption(amount, account_id, RECEIPT_DEADLINE_SEC)
 
@@ -581,11 +643,18 @@ async def deposit_amount(
         await message.answer_photo(
             photo=BufferedInputFile(logo_data, filename=logo_fname),
             caption=cap_details,
+            reply_markup=deposit_step_kb(),
         )
+    else:
+        await message.answer(cap_details, reply_markup=deposit_step_kb())
+
+    # QR отправляем БЕЗ reply_markup: Telegram запрещает править сообщение, к которому
+    # прикреплена reply-клавиатура («message can't be edited»), а подпись здесь каждую
+    # секунду обновляет счётчик оплаты. Клавиатуру несёт сообщение выше — в чате она
+    # остаётся до следующей замены.
     qr_msg = await message.answer_photo(
         photo=BufferedInputFile(png, filename=png_name),
         caption=qr_caption,
-        reply_markup=deposit_step_kb(),
     )
     schedule_payment_countdown(
         bot,
@@ -617,21 +686,36 @@ async def deposit_receipt_photo(
     deposit_id = data.get("deposit_id")
     if not deposit_id:
         await state.clear()
-        await message.answer(f"Сессия сброшена. Начните пополнение снова: {BTN_DEPOSIT}.")
+        await message.answer(
+            f"Сессия сброшена. Начните пополнение снова: {BTN_DEPOSIT}",
+            reply_markup=main_menu_kb(),
+        )
         return
 
     cancel_receipt_deadline(message.from_user.id)
     cancel_payment_countdown(message.from_user.id)
     photo = message.photo[-1]
-    await attach_receipt(
+
+    accepted = await attach_receipt(
         deposit_id=deposit_id,
+        user_id=message.from_user.id,
         receipt_file_id=photo.file_id,
         receipt_chat_id=message.chat.id,
         receipt_message_id=message.message_id,
     )
+    if not accepted:
+        # Заявка уже просрочена / обработана — второй чек к ней не принимаем.
+        await state.clear()
+        await message.answer(
+            "⏰ Эта заявка больше не активна — время оплаты истекло или её уже обработали.\n\n"
+            f"Начните заново: {BTN_DEPOSIT}",
+            reply_markup=main_menu_kb(),
+        )
+        return
 
     admin_bot: Bot | None = dispatcher.workflow_data.get("admin_bot")
     if admin_bot is None:
+        log.error("admin_bot не подключён — заявка %s без уведомления", deposit_id)
         await message.answer("Ошибка: админ-бот не подключён. Обратитесь к администратору.")
         return
 
@@ -640,8 +724,6 @@ async def deposit_receipt_photo(
     amount = data["amount"]
     uid = message.from_user.id
     uname = f"@{message.from_user.username}" if message.from_user.username else "—"
-
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -653,48 +735,61 @@ async def deposit_receipt_photo(
     )
     cap = (
         "🔔 Новая заявка на пополнение\n\n"
-        f"ID заявки: {deposit_id}\n"
+        f"ID заявки: <b>{deposit_id}</b>\n"
         f"Пользователь: {escape(uname)} (<code>{uid}</code>)\n"
         f"Счёт: {escape(bookmaker_display(title))}\n"
         f"ID счёта: <code>{escape(account_id)}</code>\n"
-        f"Сумма: {amount:,.0f} KGS"
+        f"Сумма: <b>{escape(format_kgs(amount))}</b>"
     )
 
-    # file_id от пользовательского бота недействителен для другого бота — качаем и шлём байты
-    tg_file = await bot.get_file(photo.file_id)
-    buf = io.BytesIO()
-    await bot.download_file(tg_file.file_path, buf)
-    receipt_png = buf.getvalue()
-
-    admin_ids = list(settings.admin_ids)
-    results = await asyncio.gather(
-        *[
-            admin_bot.send_photo(
-                chat_id=aid,
-                photo=BufferedInputFile(receipt_png, filename="receipt.jpg"),
-                caption=cap,
-                parse_mode="HTML",
-                reply_markup=kb,
-            )
-            for aid in admin_ids
-        ],
-        return_exceptions=True,
-    )
-    for aid, res in zip(admin_ids, results):
-        if isinstance(res, Exception):
-            log.warning("Не удалось отправить чек админу %s: %s", aid, res)
-
-    amt_str = f"{float(amount):,.2f}".replace(",", " ")
-    bm_code = str(title).strip().upper()
+    # Отвечаем пользователю сразу: заливка чека админам не должна держать его в ожидании.
     await state.clear()
     await message.answer(
         "✅ Заявка отправлена!\n\n"
-        f"💰 Сумма: {amt_str} KGS\n"
-        f"🆔 ID счета {bm_code}: {account_id}\n\n"
+        f"💰 Сумма: {format_kgs(amount)}\n"
+        f"🆔 ID счета {str(title).strip().upper()}: {account_id}\n\n"
         "⏳ Ожидайте подтверждения от оператора.\n"
         "📞 Время обработки: до 30 минут",
         reply_markup=main_menu_kb(),
     )
+
+    await _notify_admins(bot, admin_bot, deposit_id, photo.file_id, cap, kb)
+
+
+async def _notify_admins(
+    user_bot: Bot,
+    admin_bot: Bot,
+    deposit_id: int,
+    photo_file_id: str,
+    caption: str,
+    kb: InlineKeyboardMarkup,
+) -> None:
+    """Разослать чек админам и запомнить message_id каждой копии.
+
+    file_id пользовательского бота недействителен для админ-бота, поэтому первый
+    админ получает загруженные байты, а остальные — file_id из ответа Telegram:
+    так чек уходит на серверы Telegram один раз, а не N раз.
+    """
+    tg_file = await user_bot.get_file(photo_file_id)
+    buf = io.BytesIO()
+    await user_bot.download_file(tg_file.file_path, buf)
+    receipt: BufferedInputFile | str = BufferedInputFile(buf.getvalue(), filename="receipt.jpg")
+
+    for admin_id in sorted(settings.admin_ids):
+        try:
+            sent = await admin_bot.send_photo(
+                chat_id=admin_id,
+                photo=receipt,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+        except Exception as exc:
+            log.warning("Не удалось отправить чек админу %s: %s", admin_id, exc)
+            continue
+        if isinstance(receipt, BufferedInputFile) and sent.photo:
+            receipt = sent.photo[-1].file_id
+        await add_admin_message(deposit_id, sent.chat.id, sent.message_id)
 
 
 @router.message(DepositFSM.receipt)
@@ -715,7 +810,7 @@ async def history(message: Message, state: FSMContext) -> None:
     cancel_receipt_deadline(message.from_user.id)
     cancel_payment_countdown(message.from_user.id)
     await state.clear()
-    rows = await user_history(message.from_user.id)
+    rows = await user_history(message.from_user.id, limit=HISTORY_LIMIT)
     if not rows:
         await message.answer(
             "📜 <b>История пополнений</b>\n\n"
@@ -724,7 +819,8 @@ async def history(message: Message, state: FSMContext) -> None:
             reply_markup=main_menu_kb(),
         )
         return
-    parts = _history_html_chunks(rows)
+    grand_total = await user_confirmed_count(message.from_user.id)
+    parts = _history_html_chunks(rows, grand_total)
     for i, text in enumerate(parts):
         await message.answer(
             text,

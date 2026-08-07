@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections import OrderedDict
 
 from aiogram import Bot
 from aiogram.enums import ChatMemberStatus
@@ -36,6 +38,33 @@ _SUBSCRIBED_STATUSES = frozenset(
 _channel_id: int | None = None
 _check_ready: bool = True
 _check_error: str | None = None
+
+# Кэш «подписан» на пользователя: без него get_chat_member дёргался на КАЖДОЕ сообщение.
+# Кэшируем только положительный ответ — отписку ловим по истечении TTL и через chat_member.
+_SUB_CACHE_TTL_SEC = 300.0
+_SUB_CACHE_MAX = 50_000
+_sub_cache: OrderedDict[int, float] = OrderedDict()
+
+
+def cache_subscribed(user_id: int) -> None:
+    _sub_cache[user_id] = time.monotonic() + _SUB_CACHE_TTL_SEC
+    _sub_cache.move_to_end(user_id)
+    while len(_sub_cache) > _SUB_CACHE_MAX:
+        _sub_cache.popitem(last=False)
+
+
+def drop_subscription_cache(user_id: int) -> None:
+    _sub_cache.pop(user_id, None)
+
+
+def is_subscribed_cached(user_id: int) -> bool:
+    expires = _sub_cache.get(user_id)
+    if expires is None:
+        return False
+    if expires <= time.monotonic():
+        _sub_cache.pop(user_id, None)
+        return False
+    return True
 
 
 class SubscriptionCheckError(Exception):
@@ -75,7 +104,7 @@ def subscription_reply_kb() -> ReplyKeyboardMarkup:
 
 
 def subscription_inline_kb(channel: str | None = None) -> InlineKeyboardMarkup:
-    ch = (channel or settings.required_channel_username or "MIRKG_NEWS").lstrip("@")
+    ch = (channel or settings.required_channel_username or "the100som").lstrip("@")
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📢 Подписаться на канал", url=f"https://t.me/{ch}")],
@@ -85,7 +114,7 @@ def subscription_inline_kb(channel: str | None = None) -> InlineKeyboardMarkup:
 
 
 def subscription_prompt_text(channel: str | None = None) -> str:
-    ch = (channel or settings.required_channel_username or "MIRKG_NEWS").lstrip("@")
+    ch = (channel or settings.required_channel_username or "the100som").lstrip("@")
     return (
         "🔔 Подписка на канал\n\n"
         "Для продолжения работы с ботом необходимо подписаться на наш канал.\n\n"
@@ -152,10 +181,16 @@ async def is_user_subscribed(bot: Bot, user_id: int, channel: str | None = None)
 
     try:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        return is_subscribed_status(member.status)
+        subscribed = is_subscribed_status(member.status)
+        if subscribed:
+            cache_subscribed(user_id)
+        else:
+            drop_subscription_cache(user_id)
+        return subscribed
     except TelegramBadRequest as exc:
         err = str(exc).lower()
         if "user not found" in err or "participant_id_invalid" in err:
+            drop_subscription_cache(user_id)
             return False
         log.warning("Subscription check failed for user %s: %s", user_id, exc)
         raise SubscriptionCheckError(str(exc)) from exc
@@ -167,11 +202,19 @@ async def verify_user_subscribed(
     *,
     retries: int = 4,
     delay_sec: float = 1.0,
+    use_cache: bool = True,
 ) -> tuple[bool, str | None]:
     """
     Проверка с повторами (Telegram иногда обновляет статус с задержкой).
     Возвращает (подписан, текст_ошибки_конфигурации).
+
+    use_cache=False — когда пользователь сам нажал «Проверить подписку»: он ждёт
+    свежего ответа, кэш тут только мешает.
     """
+    if is_subscription_exempt(user_id):
+        return True, None
+    if use_cache and is_subscribed_cached(user_id):
+        return True, None
     if not subscription_check_ready():
         return False, _check_error or "Проверка подписки не настроена."
 

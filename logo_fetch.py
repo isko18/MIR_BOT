@@ -75,7 +75,8 @@ async def get_bookmaker_logo_bytes(canonical_name: str) -> tuple[bytes | None, s
     from bookmakers import bookmaker_local_logo_png_bytes, bookmaker_logo_url
 
     key = (canonical_name or "").strip().upper()
-    data, fname = bookmaker_local_logo_png_bytes(key)
+    # Чтение с диска + PIL блокируют event loop — выносим в поток (результат кэшируется внутри).
+    data, fname = await asyncio.to_thread(bookmaker_local_logo_png_bytes, key)
     if data:
         return data, fname
     url = bookmaker_logo_url(canonical_name)
@@ -95,17 +96,34 @@ def guess_logo_filename(url: str) -> str:
     return "logo.jpg"
 
 
+_welcome_logo: tuple[bytes | None, str] | None = None
+
+
 async def get_welcome_logo_bytes() -> tuple[bytes | None, str]:
-    """Лого при /start: сначала локальный файл, затем URL из настроек."""
+    """Лого при /start: сначала локальный файл, затем URL из настроек.
+
+    Файл читается один раз за процесс: он статичный, а /start — самый частый
+    хендлер, и синхронное чтение мегабайтного PNG тормозило весь event loop.
+    """
+    global _welcome_logo
+    if _welcome_logo is not None:
+        return _welcome_logo
+
     from config import settings
 
     path = settings.brand_logo_path
     if path is not None and path.is_file():
-        return path.read_bytes(), path.name
+        data = await asyncio.to_thread(path.read_bytes)
+        _welcome_logo = (data, path.name)
+        return _welcome_logo
 
     url = settings.brand_logo_url
     if url:
         data = await fetch_image_bytes(url)
         if data:
-            return data, guess_logo_filename(url)
-    return None, "logo.png"
+            _welcome_logo = (data, guess_logo_filename(url))
+            return _welcome_logo
+        return None, "logo.png"  # сеть могла моргнуть — попробуем ещё раз позже
+
+    _welcome_logo = (None, "logo.png")
+    return _welcome_logo

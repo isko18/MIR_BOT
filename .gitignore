@@ -1,0 +1,15 @@
+# Секреты — НИКОГДА не коммитить
+.env
+
+# Данные и логи
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/

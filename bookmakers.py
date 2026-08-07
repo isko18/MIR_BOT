@@ -67,9 +67,22 @@ def _is_local_file_logo(value: str) -> bool:
     return value == _LOCAL_FILE_LOGO
 
 
+# Конвертация через PIL — дорогая; логотипы не меняются, поэтому держим результат
+# в памяти (ключ учитывает mtime, чтобы подмена файла подхватилась без рестарта).
+_png_cache: dict[tuple[str, float, str], tuple[bytes | None, str]] = {}
+
+
 def _image_file_to_png_bytes(path: Path, filename_for_tg: str) -> tuple[bytes | None, str]:
-    if not path.is_file():
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
         return None, filename_for_tg
+
+    cache_key = (str(path), mtime, filename_for_tg)
+    cached = _png_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         from PIL import Image
 
@@ -78,9 +91,13 @@ def _image_file_to_png_bytes(path: Path, filename_for_tg: str) -> tuple[bytes | 
             rgba = im.convert("RGBA")
             buf = io.BytesIO()
             rgba.save(buf, format="PNG")
-            return buf.getvalue(), filename_for_tg if filename_for_tg.endswith(".png") else f"{filename_for_tg}.png"
+            name = filename_for_tg if filename_for_tg.endswith(".png") else f"{filename_for_tg}.png"
+            result: tuple[bytes | None, str] = (buf.getvalue(), name)
     except Exception:
-        return None, filename_for_tg
+        result = (None, filename_for_tg)
+
+    _png_cache[cache_key] = result
+    return result
 
 
 def bookmaker_menu_banner_png_bytes() -> tuple[bytes | None, str]:

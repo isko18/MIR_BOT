@@ -65,8 +65,45 @@ def _parse_admin_ids(raw: str) -> frozenset[int]:
     for part in raw.replace(" ", "").split(","):
         if not part:
             continue
-        ids.add(int(part))
+        try:
+            ids.add(int(part))
+        except ValueError:
+            raise RuntimeError(
+                f"ADMIN_IDS: «{part}» не является числовым Telegram ID"
+            ) from None
+    if not ids:
+        raise RuntimeError("ADMIN_IDS не содержит ни одного корректного ID")
     return frozenset(ids)
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    """int из .env с понятной ошибкой вместо голого ValueError при опечатке."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise RuntimeError(f"{name} должно быть целым числом, а не «{raw}»") from None
+    return max(minimum, value)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip().replace(",", ".")
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise RuntimeError(f"{name} должно быть числом, а не «{raw}»") from None
+    if value <= 0:
+        raise RuntimeError(f"{name} должно быть больше нуля")
+    return value
+
+
+# Лого приветствия по умолчанию — первый существующий файл из списка.
+# BRAND_LOGO_PATH в .env перебивает выбор.
+_BRAND_LOGO_CANDIDATES = ("лого2.png", "лого.png")
 
 
 def _resolve_brand_logo_path() -> Path | None:
@@ -76,8 +113,11 @@ def _resolve_brand_logo_path() -> Path | None:
         if not path.is_absolute():
             path = _ROOT / path
         return path if path.is_file() else None
-    default = _ROOT / "лого.png"
-    return default if default.is_file() else None
+    for name in _BRAND_LOGO_CANDIDATES:
+        candidate = _ROOT / name
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _resolve_payment_qr_path() -> Path | None:
@@ -107,7 +147,7 @@ def load_settings() -> Settings:
     brand = os.getenv("WELCOME_BRAND", "LUX ON!").strip() or "LUX ON!"
     support_bot = os.getenv("SUPPORT_BOT_USERNAME", "").strip() or None
     pub_chat = os.getenv("PUBLIC_CHAT_USERNAME", "").strip() or None
-    channel_raw = os.getenv("REQUIRED_CHANNEL_USERNAME", "MIRKG_NEWS").strip()
+    channel_raw = os.getenv("REQUIRED_CHANNEL_USERNAME", "the100som").strip()
     required_channel = channel_raw.lstrip("@") if channel_raw else None
     required_channel_id = os.getenv("REQUIRED_CHANNEL_ID", "").strip() or None
     dep_pct = _format_welcome_pct(os.getenv("WELCOME_DEPOSIT_PCT"))
@@ -132,10 +172,14 @@ def load_settings() -> Settings:
         brand_logo = None
 
     redis_url = os.getenv("REDIS_URL", "").strip() or None
-    fsm_ttl_raw = os.getenv("FSM_REDIS_TTL_SEC", "").strip()
-    fsm_redis_ttl_sec = int(fsm_ttl_raw) if fsm_ttl_raw else 1_209_600  # 14 дней
-    tg_lim_u = int(os.getenv("TELEGRAM_HTTP_LIMIT_USER", "200").strip() or "200")
-    tg_lim_a = int(os.getenv("TELEGRAM_HTTP_LIMIT_ADMIN", "80").strip() or "80")
+    fsm_redis_ttl_sec = _env_int("FSM_REDIS_TTL_SEC", 1_209_600, minimum=60)  # 14 дней
+    tg_lim_u = _env_int("TELEGRAM_HTTP_LIMIT_USER", 200, minimum=32)
+    tg_lim_a = _env_int("TELEGRAM_HTTP_LIMIT_ADMIN", 80, minimum=16)
+
+    min_amount = _env_float("MIN_AMOUNT_KGS", 35.0)
+    max_amount = _env_float("MAX_AMOUNT_KGS", 500_000.0)
+    if min_amount > max_amount:
+        raise RuntimeError("MIN_AMOUNT_KGS больше MAX_AMOUNT_KGS")
 
     return Settings(
         user_bot_token=user,
@@ -156,8 +200,10 @@ def load_settings() -> Settings:
         brand_logo_url=brand_logo,
         redis_url=redis_url,
         fsm_redis_ttl_sec=fsm_redis_ttl_sec,
-        telegram_http_limit_user=max(32, tg_lim_u),
-        telegram_http_limit_admin=max(16, tg_lim_a),
+        telegram_http_limit_user=tg_lim_u,
+        telegram_http_limit_admin=tg_lim_a,
+        min_amount_kgs=min_amount,
+        max_amount_kgs=max_amount,
     )
 
 

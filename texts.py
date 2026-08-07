@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import re
+from html import escape
 
 from config import settings
+from money import format_amount
 
 _PCT_ONLY = re.compile(r"^\s*(\d+(?:[.,]\d+)?)\s*%?\s*$")
 
@@ -26,10 +28,12 @@ def _condition_label(raw: str) -> str:
 
 def welcome_banner(first_name: str | None) -> str:
     """Текст после /start, «Отмена» и т.п. — условия из .env (WELCOME_*_PCT)."""
-    name = (first_name or "").strip() or "друг"
-    brand = settings.welcome_brand
-    dep = _condition_label(settings.welcome_deposit_pct)
-    wdr = _condition_label(settings.welcome_withdraw_pct)
+    # Баннер уходит с parse_mode=HTML: имя из Telegram может содержать «<» или «&»,
+    # и без экранирования Telegram отклонял всё сообщение — /start молча не работал.
+    name = escape((first_name or "").strip()) or "друг"
+    brand = escape(settings.welcome_brand)
+    dep = escape(_condition_label(settings.welcome_deposit_pct))
+    wdr = escape(_condition_label(settings.welcome_withdraw_pct))
 
     lines = [
         f"Привет, {name}! 👋",
@@ -67,13 +71,16 @@ RECEIPT_TIMEOUT_MESSAGE = """⏰ Пополнение отменено, врем
 Начните заново, нажав на Пополнить"""
 
 
-INSTRUCTION = """📖 Инструкция
+# Лимиты берём из настроек, иначе текст расходится с реальной проверкой в хендлере.
+INSTRUCTION = f"""📖 Инструкция
 
 1. Нажмите «💳 Пополнить» и выберите букмекера.
 2. Введите ID вашего игрового счёта.
-3. Укажите сумму (от 35 до 500 000 KGS).
-4. Оплатите по QR-коду и отправьте чек фото в этот чат.
-5. После проверки администратором счёт будет пополнен — придёт уведомление.
+3. Укажите сумму (от {format_amount(settings.min_amount_kgs)} до \
+{format_amount(settings.max_amount_kgs)} KGS).
+4. Оплатите по QR-коду — сумму нужно перевести точь-в-точь, до копеек.
+5. Отправьте фото чека в этот чат — на оплату и чек даётся 5 минут.
+6. После проверки администратором счёт будет пополнен — придёт уведомление.
 
 По вопросам вывода и спорных ситуаций — раздел «🛟 Тех. поддержка»."""
 
